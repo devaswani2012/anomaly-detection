@@ -38,7 +38,6 @@ Resources:
 
   S3Bucket:
     Type: AWS::S3::Bucket
-    DependsOn: SNSTopicPolicy
     Properties:
       BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}-${AWS::Region}-anomaly"
       NotificationConfiguration:

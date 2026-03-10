@@ -1,7 +1,9 @@
 import os
 import json
+import io
 import boto3
 import urllib.request
+import pandas as pd
 from fastapi import FastAPI, Request, BackgroundTasks
 
 from processor import process_file
@@ -45,23 +47,74 @@ def current_baseline():
 def anomaly_summary():
     logger.info("Anomaly summary requested")
     try:
-        baseline_mgr = BaselineManager(bucket=BUCKET_NAME)
-        baseline = baseline_mgr.load()
+        response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix="processed/")
+        contents = response.get("Contents", [])
 
-        summary = {
-            col: {
-                "count": baseline.get(col, {}).get("count"),
-                "mean": baseline.get(col, {}).get("mean"),
-                "std": baseline.get(col, {}).get("std"),
-            }
-            for col in ["temperature", "humidity", "pressure", "wind_speed"]
-            if col in baseline
+        summary_keys = [
+            obj["Key"] for obj in contents
+            if obj["Key"].endswith("_summary.json")
+        ]
+
+        total_rows = 0
+        total_anomalies = 0
+        files_processed = 0
+
+        for key in summary_keys:
+            obj = s3.get_object(Bucket=BUCKET_NAME, Key=key)
+            summary = json.loads(obj["Body"].read())
+
+            total_rows += summary.get("total_rows", 0)
+            total_anomalies += summary.get("anomaly_count", 0)
+            files_processed += 1
+
+        overall_rate = round(total_anomalies / total_rows, 4) if total_rows > 0 else 0
+
+        return {
+            "files_processed": files_processed,
+            "total_rows": total_rows,
+            "total_anomalies": total_anomalies,
+            "overall_anomaly_rate": overall_rate
         }
-
-        return summary
     except Exception as e:
         logger.error(f"Error generating anomaly summary: {str(e)}")
         return {"error": "Failed to generate summary"}
+
+
+@app.get("/anomalies/recent")
+def anomalies_recent(limit: int = 50):
+    logger.info(f"Recent anomalies requested with limit={limit}")
+    try:
+        response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix="processed/")
+        contents = response.get("Contents", [])
+
+        csv_files = [
+            obj["Key"] for obj in contents
+            if obj["Key"].endswith(".csv")
+        ]
+
+        recent_files = sorted(csv_files, reverse=True)[:10]
+
+        rows = []
+        for key in recent_files:
+            obj = s3.get_object(Bucket=BUCKET_NAME, Key=key)
+            df = pd.read_csv(io.BytesIO(obj["Body"].read()))
+            if "anomaly" in df.columns:
+                flagged = df[df["anomaly"] == True].copy()
+                if not flagged.empty:
+                    flagged["source_file"] = key
+                    rows.append(flagged)
+
+        if not rows:
+            return {"anomalies": [], "count": 0}
+
+        result = pd.concat(rows, ignore_index=True).head(limit)
+        return {
+            "anomalies": result.to_dict(orient="records"),
+            "count": len(result)
+        }
+    except Exception as e:
+        logger.error(f"Error getting recent anomalies: {str(e)}")
+        return {"error": "Failed to load recent anomalies"}
 
 
 @app.post("/notify")

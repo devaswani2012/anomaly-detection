@@ -12,9 +12,15 @@ s3 = boto3.client("s3")
 
 class BaselineManager:
 
-    def __init__(self, bucket: str, baseline_key: str = "state/baseline.json"):
+    def __init__(
+        self,
+        bucket: str,
+        baseline_key: str = "state/baseline.json",
+        log_key: str = "state/app.log"
+    ):
         self.bucket = bucket
         self.baseline_key = baseline_key
+        self.log_key = log_key
 
     def load(self) -> dict:
         try:
@@ -32,6 +38,7 @@ class BaselineManager:
     def save(self, baseline: dict):
         try:
             baseline["last_updated"] = datetime.utcnow().isoformat()
+
             s3.put_object(
                 Bucket=self.bucket,
                 Key=self.baseline_key,
@@ -39,8 +46,20 @@ class BaselineManager:
                 ContentType="application/json"
             )
             logger.info(f"Baseline saved to s3://{self.bucket}/{self.baseline_key}")
+
+            with open("app.log", "rb") as log_file:
+                s3.put_object(
+                    Bucket=self.bucket,
+                    Key=self.log_key,
+                    Body=log_file.read(),
+                    ContentType="text/plain"
+                )
+            logger.info(f"Log file synced to s3://{self.bucket}/{self.log_key}")
+        except FileNotFoundError:
+            logger.error("app.log not found while attempting S3 log sync")
+            raise
         except Exception as e:
-            logger.error(f"Error saving baseline: {str(e)}")
+            logger.error(f"Error saving baseline or syncing log: {str(e)}")
             raise
 
     def update(self, baseline: dict, channel: str, new_values: list[float]) -> dict:

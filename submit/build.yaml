@@ -1,4 +1,3 @@
-# cloudformation solution goes here
 AWSTemplateFormatVersion: '2010-09-09'
 Description: DS5220 Data Project 1 stack for anomaly detection
 
@@ -36,22 +35,6 @@ Resources:
     Properties:
       TopicName: ds5220-dp1
 
-  S3Bucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}-${AWS::Region}-anomaly"
-      NotificationConfiguration:
-        TopicConfigurations:
-          - Event: s3:ObjectCreated:*
-            Topic: !Ref SNSTopic
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: raw/
-                  - Name: suffix
-                    Value: .csv
-
   SNSTopicPolicy:
     Type: AWS::SNS::TopicPolicy
     Properties:
@@ -68,7 +51,24 @@ Resources:
             Resource: !Ref SNSTopic
             Condition:
               ArnLike:
-                aws:SourceArn: !GetAtt S3Bucket.Arn
+                aws:SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-${AWS::AccountId}-${AWS::Region}-anomaly"
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DependsOn: SNSTopicPolicy
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}-${AWS::Region}-anomaly"
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectCreated:*
+            Topic: !Ref SNSTopic
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+                  - Name: suffix
+                    Value: .csv
 
   EC2Role:
     Type: AWS::IAM::Role
@@ -149,7 +149,7 @@ Resources:
           apt-get install -y git python3 python3-pip python3-venv
 
           export BUCKET_NAME='${S3Bucket}'
-          echo "BUCKET_NAME='${S3Bucket}'" >> /etc/environment
+          echo "BUCKET_NAME=${S3Bucket}" >> /etc/environment
 
           git clone ${GitRepoURL} /opt/anomaly-detection
           chown -R ubuntu:ubuntu /opt/anomaly-detection
@@ -202,19 +202,25 @@ Resources:
 
 Outputs:
   InstanceId:
+    Description: EC2 instance ID
     Value: !Ref EC2Instance
 
   ElasticIP:
+    Description: Elastic IP address
     Value: !Ref EC2ElasticIP
 
   APIEndpoint:
+    Description: FastAPI endpoint
     Value: !Sub "http://${EC2ElasticIP}:8000"
 
   NotifyEndpoint:
+    Description: SNS notify endpoint
     Value: !Sub "http://${EC2ElasticIP}:8000/notify"
 
   BucketName:
+    Description: S3 bucket name
     Value: !Ref S3Bucket
 
   SNSTopicARN:
+    Description: SNS topic ARN
     Value: !Ref SNSTopic

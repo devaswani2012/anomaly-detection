@@ -1,130 +1,99 @@
-# app.py
-import io
-import json
 import os
+import json
 import boto3
-import pandas as pd
-import requests
-from datetime import datetime
-from fastapi import FastAPI, BackgroundTasks, Request
-from baseline import BaselineManager
+import urllib.request
+from fastapi import FastAPI, Request, BackgroundTasks
+
 from processor import process_file
+from baseline import BaselineManager
+from logger import logger
 
-app = FastAPI(title="Anomaly Detection Pipeline")
+app = FastAPI()
 
-s3 = boto3.client("s3")
+logger.info("Anomaly Detection API started")
+
 BUCKET_NAME = os.environ["BUCKET_NAME"]
 
-# ── SNS subscription confirmation + message handler ──────────────────────────
-
-@app.post("/notify")
-async def handle_sns(request: Request, background_tasks: BackgroundTasks):
-    body = await request.json()
-    msg_type = request.headers.get("x-amz-sns-message-type")
-
-    # SNS sends a SubscriptionConfirmation before it will deliver any messages.
-    # Visiting the SubscribeURL confirms the subscription.
-    if msg_type == "SubscriptionConfirmation":
-        confirm_url = body["SubscribeURL"]
-        requests.get(confirm_url)
-        return {"status": "confirmed"}
-
-    if msg_type == "Notification":
-        # The SNS message body contains the S3 event as a JSON string
-        s3_event = json.loads(body["Message"])
-        for record in s3_event.get("Records", []):
-            key = record["s3"]["object"]["key"]
-            if key.startswith("raw/") and key.endswith(".csv"):
-                background_tasks.add_task(process_file, BUCKET_NAME, key)
-
-    return {"status": "ok"}
+s3 = boto3.client("s3")
 
 
-# ── Query endpoints ───────────────────────────────────────────────────────────
-
-@app.get("/anomalies/recent")
-def get_recent_anomalies(limit: int = 50):
-    """Return rows flagged as anomalies across the 10 most recent processed files."""
-    paginator = s3.get_paginator("list_objects_v2")
-    pages = paginator.paginate(Bucket=BUCKET_NAME, Prefix="processed/")
-
-    keys = sorted(
-        [
-            obj["Key"]
-            for page in pages
-            for obj in page.get("Contents", [])
-            if obj["Key"].endswith(".csv")
-        ],
-        reverse=True,
-    )[:10]
-
-    all_anomalies = []
-    for key in keys:
-        response = s3.get_object(Bucket=BUCKET_NAME, Key=key)
-        df = pd.read_csv(io.BytesIO(response["Body"].read()))
-        if "anomaly" in df.columns:
-            flagged = df[df["anomaly"] == True].copy()
-            flagged["source_file"] = key
-            all_anomalies.append(flagged)
-
-    if not all_anomalies:
-        return {"count": 0, "anomalies": []}
-
-    combined = pd.concat(all_anomalies).head(limit)
-    return {"count": len(combined), "anomalies": combined.to_dict(orient="records")}
-
-
-@app.get("/anomalies/summary")
-def get_anomaly_summary():
-    """Aggregate anomaly rates across all processed files using their summary JSONs."""
-    paginator = s3.get_paginator("list_objects_v2")
-    pages = paginator.paginate(Bucket=BUCKET_NAME, Prefix="processed/")
-
-    summaries = []
-    for page in pages:
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith("_summary.json"):
-                response = s3.get_object(Bucket=BUCKET_NAME, Key=obj["Key"])
-                summaries.append(json.loads(response["Body"].read()))
-
-    if not summaries:
-        return {"message": "No processed files yet."}
-
-    total_rows = sum(s["total_rows"] for s in summaries)
-    total_anomalies = sum(s["anomaly_count"] for s in summaries)
-
-    return {
-        "files_processed": len(summaries),
-        "total_rows_scored": total_rows,
-        "total_anomalies": total_anomalies,
-        "overall_anomaly_rate": round(total_anomalies / total_rows, 4) if total_rows > 0 else 0,
-        "most_recent": sorted(summaries, key=lambda x: x["processed_at"], reverse=True)[:5],
-    }
-
-
-@app.get("/baseline/current")
-def get_current_baseline():
-    """Show the current per-channel statistics the detector is working from."""
-    baseline_mgr = BaselineManager(bucket=BUCKET_NAME)
-    baseline = baseline_mgr.load()
-
-    channels = {}
-    for channel, stats in baseline.items():
-        if channel == "last_updated":
-            continue
-        channels[channel] = {
-            "observations": stats["count"],
-            "mean": round(stats["mean"], 4),
-            "std": round(stats.get("std", 0.0), 4),
-            "baseline_mature": stats["count"] >= 30,
-        }
-
-    return {
-        "last_updated": baseline.get("last_updated"),
-        "channels": channels,
-    }
+@app.get("/")
+def root():
+    logger.info("Root endpoint called")
+    return {"message": "Anomaly detection service running"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "bucket": BUCKET_NAME, "timestamp": datetime.utcnow().isoformat()}
+    logger.info("Health endpoint called")
+    return {"status": "ok"}
+
+
+@app.get("/baseline/current")
+def current_baseline():
+    logger.info("Baseline requested")
+    try:
+        baseline_mgr = BaselineManager(bucket=BUCKET_NAME)
+        baseline = baseline_mgr.load()
+        return baseline
+    except Exception as e:
+        logger.error(f"Error loading current baseline: {str(e)}")
+        return {"error": "Failed to load baseline"}
+
+
+@app.get("/anomalies/summary")
+def anomaly_summary():
+    logger.info("Anomaly summary requested")
+    try:
+        baseline_mgr = BaselineManager(bucket=BUCKET_NAME)
+        baseline = baseline_mgr.load()
+
+        summary = {
+            col: {
+                "count": baseline.get(col, {}).get("count"),
+                "mean": baseline.get(col, {}).get("mean"),
+                "std": baseline.get(col, {}).get("std"),
+            }
+            for col in ["temperature", "humidity", "pressure", "wind_speed"]
+            if col in baseline
+        }
+
+        return summary
+    except Exception as e:
+        logger.error(f"Error generating anomaly summary: {str(e)}")
+        return {"error": "Failed to generate summary"}
+
+
+@app.post("/notify")
+async def notify(request: Request, background_tasks: BackgroundTasks):
+    logger.info("SNS message received")
+
+    try:
+        body = await request.json()
+        message_type = body.get("Type")
+
+        if message_type == "SubscriptionConfirmation":
+            subscribe_url = body.get("SubscribeURL")
+            if subscribe_url:
+                urllib.request.urlopen(subscribe_url)
+                logger.info("SNS subscription confirmed")
+                return {"status": "subscription confirmed"}
+            logger.error("SubscriptionConfirmation received without SubscribeURL")
+            return {"error": "missing SubscribeURL"}
+
+        if message_type == "Notification":
+            message = json.loads(body["Message"])
+            record = message["Records"][0]
+            bucket = record["s3"]["bucket"]["name"]
+            key = record["s3"]["object"]["key"]
+
+            logger.info(f"Queueing processing for s3://{bucket}/{key}")
+            background_tasks.add_task(process_file, bucket, key)
+
+            return {"status": "accepted", "bucket": bucket, "key": key}
+
+        logger.info("Unknown SNS message type received")
+        return {"status": "ignored"}
+    except Exception as e:
+        logger.error(f"Error processing notification: {str(e)}")
+        return {"error": "processing failed"}

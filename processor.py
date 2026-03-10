@@ -7,52 +7,72 @@ from datetime import datetime
 
 from baseline import BaselineManager
 from detector import AnomalyDetector
+from logger import logger
 
 s3 = boto3.client("s3")
 
-
-NUMERIC_COLS = ["temperature", "humidity", "pressure", "wind_speed"]  # students configure this
+NUMERIC_COLS = ["temperature", "humidity", "pressure", "wind_speed"]
 
 def process_file(bucket: str, key: str):
-    print(f"Processing: s3://{bucket}/{key}")
+    logger.info(f"Processing started for s3://{bucket}/{key}")
 
-    # 1. Download raw file
-    response = s3.get_object(Bucket=bucket, Key=key)
-    df = pd.read_csv(io.BytesIO(response["Body"].read()))
+    try:
+        response = s3.get_object(Bucket=bucket, Key=key)
+        df = pd.read_csv(io.BytesIO(response["Body"].read()))
+        logger.info(f"Loaded {len(df)} rows from {key} with columns {list(df.columns)}")
+    except Exception as e:
+        logger.error(f"Failed to download or read file {key}: {str(e)}")
+        raise
 
-    print(f"  Loaded {len(df)} rows, columns: {list(df.columns)}")
+    try:
+        baseline_mgr = BaselineManager(bucket=bucket)
+        baseline = baseline_mgr.load()
+        logger.info("Baseline loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to load baseline: {str(e)}")
+        raise
 
-    # 2. Load current baseline
-    baseline_mgr = BaselineManager(bucket=bucket)
-    baseline = baseline_mgr.load()
+    try:
+        for col in NUMERIC_COLS:
+            if col in df.columns:
+                clean_values = df[col].dropna().tolist()
+                if clean_values:
+                    baseline = baseline_mgr.update(baseline, col, clean_values)
+                    logger.info(f"Updated baseline for column {col} with {len(clean_values)} values")
+    except Exception as e:
+        logger.error(f"Failed while updating baseline: {str(e)}")
+        raise
 
-    # 3. Update baseline with values from this batch BEFORE scoring
-    #    (use only non-null values for each channel)
-    for col in NUMERIC_COLS:
-        if col in df.columns:
-            clean_values = df[col].dropna().tolist()
-            if clean_values:
-                baseline = baseline_mgr.update(baseline, col, clean_values)
+    try:
+        detector = AnomalyDetector(z_threshold=3.0, contamination=0.05)
+        scored_df = detector.run(df, NUMERIC_COLS, baseline, method="both")
+        logger.info("Anomaly detection completed successfully")
+    except Exception as e:
+        logger.error(f"Failed during anomaly detection: {str(e)}")
+        raise
 
-    # 4. Run detection
-    detector = AnomalyDetector(z_threshold=3.0, contamination=0.05)
-    scored_df = detector.run(df, NUMERIC_COLS, baseline, method="both")
+    try:
+        output_key = key.replace("raw/", "processed/")
+        csv_buffer = io.StringIO()
+        scored_df.to_csv(csv_buffer, index=False)
+        s3.put_object(
+            Bucket=bucket,
+            Key=output_key,
+            Body=csv_buffer.getvalue(),
+            ContentType="text/csv"
+        )
+        logger.info(f"Processed CSV written to s3://{bucket}/{output_key}")
+    except Exception as e:
+        logger.error(f"Failed to write processed file: {str(e)}")
+        raise
 
-    # 5. Write scored file to processed/ prefix
-    output_key = key.replace("raw/", "processed/")
-    csv_buffer = io.StringIO()
-    scored_df.to_csv(csv_buffer, index=False)
-    s3.put_object(
-        Bucket=bucket,
-        Key=output_key,
-        Body=csv_buffer.getvalue(),
-        ContentType="text/csv"
-    )
+    try:
+        baseline_mgr.save(baseline)
+        logger.info("Baseline saved successfully")
+    except Exception as e:
+        logger.error(f"Failed to save baseline: {str(e)}")
+        raise
 
-    # 6. Save updated baseline back to S3
-    baseline_mgr.save(baseline)
-
-    # 7. Build and return a processing summary
     anomaly_count = int(scored_df["anomaly"].sum()) if "anomaly" in scored_df else 0
     summary = {
         "source_key": key,
@@ -66,14 +86,18 @@ def process_file(bucket: str, key: str):
         }
     }
 
-    # Write summary JSON alongside the processed file
-    summary_key = output_key.replace(".csv", "_summary.json")
-    s3.put_object(
-        Bucket=bucket,
-        Key=summary_key,
-        Body=json.dumps(summary, indent=2),
-        ContentType="application/json"
-    )
+    try:
+        summary_key = output_key.replace(".csv", "_summary.json")
+        s3.put_object(
+            Bucket=bucket,
+            Key=summary_key,
+            Body=json.dumps(summary, indent=2),
+            ContentType="application/json"
+        )
+        logger.info(f"Summary JSON written to s3://{bucket}/{summary_key}")
+    except Exception as e:
+        logger.error(f"Failed to write summary file: {str(e)}")
+        raise
 
-    print(f"  Done: {anomaly_count}/{len(df)} anomalies flagged")
+    logger.info(f"Processing finished for {key}: {anomaly_count}/{len(df)} anomalies flagged")
     return summary
